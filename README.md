@@ -62,6 +62,16 @@ baseline scores 0.3636 on all six practice cases per the competition spec;
 the five-case figure here (0.3925) is the same program scored on p00–p04
 only. Median error 0.59–1.29 points; 90% coverage 0.83–0.98.
 
+## Revision pass (2026-11-13)
+
+29 parameter variants were tested on the same 5-case practice score
+(window, tails, floor, renorm, jump term, sigma multiplier, alpha).
+None was adopted: the best combo (sigma multiplier 0.75 + upside tail
+1.15) scored 0.3059 vs the 0.3069 prototype baseline, a 0.001 gain under
+1 standard error of the 5-case deltas, with mixed per-case signs —
+noise-level fitting on 5 cases. The practice score is unchanged at
+**0.3072** vs house 0.3925, and a line-by-line code review found no bugs.
+
 ## Files
 
 - `main.ts` — the entry program (Node 22, stdlib only)
