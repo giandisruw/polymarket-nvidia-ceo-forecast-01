@@ -27,6 +27,14 @@
 //     non-decreasing; the program is deterministic (no randomness, no clock),
 //     stdlib only, and runs a case in well under a second.
 //
+// Revision pass 2026-11-13: 29 parameter variants were tested on the same
+// 5-case practice score (window, tails, floor, renorm, jump term, sigma
+// multiplier, alpha). The best combo (sigma mult 0.75 + upside tail 1.15)
+// scored 0.3059 vs the 0.3069 prototype baseline but was NOT adopted: the
+// 0.001 gain is under 1 standard error of the 5-case deltas, with mixed
+// per-case signs — noise-level fitting on 5 cases. Parameters stay at
+// their robust values; a line-by-line review also found no bugs.
+//
 // Input/output contract (program/v1): read every <id>.in in the input dir
 // (MAKEFUN_INPUT_DIR, default /input), write <id>.out to the output dir
 // (MAKEFUN_OUTPUT_DIR, default /output) as {"forecasts":[{"id","q"}]}, q
