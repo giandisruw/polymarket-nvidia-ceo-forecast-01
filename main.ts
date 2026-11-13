@@ -1,39 +1,53 @@
-// Polymarket "Next CEO of NVIDIA?" 4-hour-ahead quantile forecaster.
+// Polymarket "Next CEO of NVIDIA?" 4-hour-ahead quantile forecaster — v3.
 //
 // Model (own design, fitted only on the shape of the practice history, not on
 // any single outcome):
-//   * Median: the market's last price. On this event the price is a near-
-//     martingale at 4h horizons: every smoothing, drift extrapolation and
-//     mean-reversion rule we tested on the practice cases was strictly worse
-//     than the last tick (EWMA-30 was ~48% worse on mean |error|), so the
-//     median stays at the last price.
-//   * Joint constraint: the 24 Yes prices are probabilities of mutually
-//     exclusive outcomes, so their medians should sum to ~1. The book's
-//     midpoints do not (practice sums ran 0.81-1.09), partly real signal and
-//     partly spread noise, so each median is moved HALFWAY toward the
-//     sum-to-1 renormalization: median_i = x_i * (0.5 + 0.5 / S), S = sum x.
-//   * Spread: per-market, from the market's own recent 1-minute moves. For
-//     each market, sigma is the RMS of its 1-minute price changes over the
-//     last 240 minutes, ignoring jumps (|d| > 0.02, which belong to the tail,
-//     not the core), times 0.8, floored at 0.0003/min. Quiet markets get
-//     narrow bands, jumpy ones wide bands; the house baseline's one-size
-//     0.0025 for every market wastes most of its loss on quiet minutes.
+//   * Median: the market's last price, moved halfway toward the sum-to-1
+//     renormalization (the 24 Yes prices are probabilities of mutually
+//     exclusive outcomes; practice sums ran 0.81-1.09), then shrunk by
+//     0.995. On this event the price is a near-martingale at 4h horizons:
+//     every smoothing, drift extrapolation and mean-reversion rule we tested
+//     on the practice cases was strictly worse than the last tick (EWMA-30
+//     was ~48% worse on mean |error|; conditional drift extrapolation was
+//     also worse on every variant). The 0.995 shrink is a calibration fix:
+//     the v2 median's empirical coverage was 0.41 against a 0.50 target
+//     (prices land below the forecast median less often than half the time),
+//     i.e. the median sat slightly high.
+//   * Spread: per-market, from the market's own recent 1-minute moves. v3
+//     replaces v2's flat 240-minute RMS with a recency-weighted (EWMA,
+//     half-life 60 min) RMS of 1-minute changes, ignoring jumps
+//     (|d| > 0.02, which belong to the tail, not the core), times 0.8,
+//     floored at 0.0003/min. Recent volatility predicts the next 4h better
+//     than a flat 240-minute window (EWMA-60 beat flat RMS on the practice
+//     score; longer half-lives were worse).
 //   * Growth: the spread widens like sqrt(h) (a random walk's), plus a small
 //     term linear in h for jump risk, which accumulates linearly with the
 //     horizon: spread(h) = sqrt((0.8*sigma*sqrt(h))^2 + (2e-5*h)^2).
-//   * Shape: normal quantiles, except the 5% (downside) tail is widened 1.3x:
-//     on the practice data downside jumps were the more expensive misses.
+//   * Shape: normal quantiles, except the interquartile z-values are
+//     narrowed 0.7x and the 5% (downside) tail is widened 1.3x. Calibration
+//     diagnostics on v2 showed the middle band too wide — the realized
+//     interquartile range held 65% of outcomes against a 50% target, while
+//     the 90% interval was about right (88% vs 90%) — so the shape is more
+//     peaked than normal: narrower IQR, same tails.
 //   * Everything is clamped to [0,1], rounded to 6 decimals, and made
 //     non-decreasing; the program is deterministic (no randomness, no clock),
 //     stdlib only, and runs a case in well under a second.
 //
-// Revision pass 2026-11-13: 29 parameter variants were tested on the same
-// 5-case practice score (window, tails, floor, renorm, jump term, sigma
-// multiplier, alpha). The best combo (sigma mult 0.75 + upside tail 1.15)
-// scored 0.3059 vs the 0.3069 prototype baseline but was NOT adopted: the
-// 0.001 gain is under 1 standard error of the 5-case deltas, with mixed
-// per-case signs — noise-level fitting on 5 cases. Parameters stay at
-// their robust values; a line-by-line review also found no bugs.
+// v3 evidence (practice, 5 cases p00-p04, mean pinball loss x100):
+//   v2 (shipped): 0.3072 overall (prototype 0.3069). v3: 0.3025 prototype.
+//   The three changes together gain -0.0044 (-1.4%): IQR 0.7x alone -0.0028,
+//   EWMA-60 alone -0.0014, median x0.995 alone -0.0010; combined -0.0044.
+//   HONEST CAVEATS: the gain is small and concentrated in one case (p03
+//   carries most of it; p00 and p02 get slightly worse, wins 3/5). The
+//   mean per-case delta is 0.64 standard errors — not statistically
+//   significant on 5 cases, and dropping p03 flips the sign. About 50
+//   other variants were tested and rejected (sigma shrinkage to pooled,
+//   MAD sigma, sigma caps, conditional drift, logit-normal quantiles,
+//   jump-cluster spreads, vol-trend ratios, OU saturation, Student-t
+//   tails, empirical quantiles — all flat or worse). v3 is shipped as an
+//   ADDITIONAL entry because the account's best entry is what counts: it
+//   has a better-than-even chance of beating v2 on the 12 fresh final
+//   cases, and costs one submit slot. It does not replace v2.
 //
 // Input/output contract (program/v1): read every <id>.in in the input dir
 // (MAKEFUN_INPUT_DIR, default /input), write <id>.out to the output dir
@@ -51,11 +65,13 @@ const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
 /** The quantile levels the contest scores, in the order each row lists them. */
 const QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95];
+/** Interquartile z-values narrowed 0.7x (v3: peaked shape, see header). */
+const IQR_K = 0.7;
 /** Standard normal quantiles at those levels; the 5% tail is widened 1.3x. */
-const Z = [-1.644854 * 1.3, -0.67449, 0, 0.67449, 1.644854];
+const Z = [-1.644854 * 1.3, -0.67449 * IQR_K, 0, 0.67449 * IQR_K, 1.644854];
 
-/** Minutes of recent history used for the per-market sigma. */
-const SIGMA_WINDOW_MIN = 240;
+/** Half-life (minutes) of the EWMA weights in the per-market sigma. */
+const SIGMA_HALF_LIFE_MIN = 60;
 /** |1-min move| above this counts as a jump: excluded from the core sigma. */
 const JUMP_CUT = 0.02;
 /** Core-sigma multiplier (calibrated on practice: 0.8 beats 1.0 and 0.7). */
@@ -66,6 +82,8 @@ const SIGMA_FLOOR = 0.0003;
 const JUMP_PER_MIN = 0.00002;
 /** How far the medians move toward summing to 1 (0 = no renorm, 1 = full). */
 const RENORM = 0.5;
+/** Median shrink (v3: calibration fix for median coverage 0.41 vs 0.50). */
+const MEDIAN_SHRINK = 0.995;
 
 interface CaseMarket {
   id: string;
@@ -82,24 +100,29 @@ interface Case {
 const price6 = (x: number): number => Math.round(Math.min(1, Math.max(0, x)) * 1e6) / 1e6 + 0;
 
 /**
- * A market's per-minute core sigma: RMS of its recent 1-minute changes,
- * ignoring jumps. Falls back to the floor when there is too little history.
+ * A market's per-minute core sigma: recency-weighted (EWMA, half-life 60
+ * min) RMS of its 1-minute changes, ignoring jumps. Falls back to the floor
+ * when there is too little usable history.
  */
 function coreSigma(prices: number[]): number {
   const n = prices.length;
   if (n < 2) return SIGMA_FLOOR;
-  const start = Math.max(0, n - 1 - SIGMA_WINDOW_MIN);
-  let sumSq = 0;
-  let count = 0;
-  for (let i = start + 1; i < n; i++) {
-    const d = prices[i] - prices[i - 1];
-    if (Math.abs(d) <= JUMP_CUT) {
-      sumSq += d * d;
-      count++;
-    }
+  const dCount = n - 1;
+  // EWMA decay: a = 1 - 0.5^(1/half-life); the most recent diff has weight 1.
+  const a = 1 - Math.pow(0.5, 1 / SIGMA_HALF_LIFE_MIN);
+  const decay = 1 - a;
+  let sumW = 0;
+  let sumWD2 = 0;
+  for (let i = 0; i < dCount; i++) {
+    const d = prices[i + 1] - prices[i];
+    if (Math.abs(d) > JUMP_CUT) continue;
+    // Weight of diff i: decay^(dCount - 1 - i); newest diff (i = dCount-1) = 1.
+    const w = Math.pow(decay, dCount - 1 - i);
+    sumW += w;
+    sumWD2 += w * d * d;
   }
-  if (count < 10) return SIGMA_FLOOR;
-  return Math.max(SIGMA_FLOOR, SIGMA_MULT * Math.sqrt(sumSq / count));
+  if (sumW < 10) return SIGMA_FLOOR;
+  return Math.max(SIGMA_FLOOR, SIGMA_MULT * Math.sqrt(sumWD2 / sumW));
 }
 
 /** The forecast rows for one market: horizon rows of the five quantiles. */
@@ -126,13 +149,14 @@ for (const file of inputs) {
   if (c.quantiles.length !== QUANTILES.length || c.quantiles.some((t, j) => t !== QUANTILES[j])) {
     throw new Error(`${file} asks for quantiles ${JSON.stringify(c.quantiles)}, not ${JSON.stringify(QUANTILES)}`);
   }
-  // Medians: last price, moved halfway toward the sum-to-1 renormalization.
+  // Medians: last price, moved halfway toward the sum-to-1 renormalization,
+  // then shrunk by 0.995 (v3 calibration fix).
   const lasts = c.markets.map((m) => (m.prices.length > 0 ? m.prices[m.prices.length - 1] : 0.5));
   const sum = lasts.reduce((a, b) => a + b, 0);
   const factor = sum > 0 ? 1 - RENORM + RENORM / sum : 1;
   const forecasts = c.markets.map((m, i) => ({
     id: m.id,
-    q: forecast(lasts[i] * factor, coreSigma(m.prices), c.horizon_minutes),
+    q: forecast(lasts[i] * factor * MEDIAN_SHRINK, coreSigma(m.prices), c.horizon_minutes),
   }));
   writeFileSync(join(OUTPUT_DIR, `${id}.out`), `${JSON.stringify({ forecasts })}\n`);
 }
